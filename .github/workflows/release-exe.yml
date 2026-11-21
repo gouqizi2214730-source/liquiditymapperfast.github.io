@@ -1,0 +1,235 @@
+name: Build Standalone Desktop Release
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - master
+
+permissions:
+  contents: write
+
+jobs:
+  build-release:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout upstream clean commit
+        uses: actions/checkout@v4
+        with:
+          repository: liquiditymapperfast/liquiditymapperfast.github.io
+          ref: 6cb88d6407590bc9956e2dfeaf0ccdfc14f9dd8b
+          path: lmap_src
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Inject Chinese localization and anti-redirect patch
+        shell: python
+        run: |
+          from pathlib import Path
+          patch_js = """
+          (function() {
+            const origOpen = window.open;
+            window.open = function(url) {
+              if (url && String(url).includes('liquiditymapper.com')) return null;
+              return origOpen.apply(this, arguments);
+            };
+            document.addEventListener('click', function(e) {
+              const a = e.target && e.target.closest ? e.target.closest('a') : null;
+              if (a && a.href && a.href.includes('liquiditymapper.com')) {
+                e.preventDefault();
+                e.stopPropagation();
+              }
+            }, true);
+            const dict = {
+              'Order Book': '订单簿',
+              'Footprint': '足迹图',
+              'Heatmap': '热力图',
+              'Liquidity': '流动性',
+              'Settings': '设置',
+              'Exchange': '交易所',
+              'Symbol': '交易对',
+              'Timeframe': '时间周期',
+              'Volume': '成交量',
+              'Price': '价格',
+              'Buy': '买入',
+              'Sell': '卖出',
+              'Bid': '买盘',
+              'Ask': '卖盘',
+              'Depth': '深度',
+              'Cluster': '聚类',
+              'Imbalance': '失衡',
+              'Reset': '重置',
+              'Connect': '连接',
+              'Disconnect': '断开'
+            };
+            const keys = Object.keys(dict).sort((a, b) => b.length - a.length);
+            function translateNode(node) {
+              if (node.nodeType === 3) {
+                let txt = node.nodeValue;
+                if (!txt || !txt.trim()) return;
+                for (const k of keys) {
+                  if (txt.includes(k)) {
+                    txt = txt.split(k).join(dict[k]);
+                  }
+                }
+                if (txt !== node.nodeValue) node.nodeValue = txt;
+              } else if (node.nodeType === 1 && node.tagName !== 'SCRIPT' && node.tagName !== 'STYLE') {
+                for (const child of node.childNodes) translateNode(child);
+              }
+            }
+            const observer = new MutationObserver(() => translateNode(document.body));
+            window.addEventListener('DOMContentLoaded', () => {
+              translateNode(document.body);
+              observer.observe(document.body, { childList: true, subtree: true, characterData: true });
+            });
+          })();
+          """
+          index_path = Path('lmap_src/index.html')
+          html = index_path.read_text(encoding='utf-8')
+          html = html.replace('</head>', f'<script>{patch_js}</script></head>')
+          index_path.write_text(html, encoding='utf-8')
+
+      - name: Build frontend
+        working-directory: lmap_src
+        run: |
+          npm install
+          npx vite build --base=./
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pyinstaller pillow pywebview
+
+      - name: Generate icon, launcher, and Inno Setup script
+        shell: python
+        run: |
+          import textwrap
+          from PIL import Image, ImageDraw
+          img = Image.new('RGBA', (256, 256), (15, 23, 42, 255))
+          draw = ImageDraw.Draw(img)
+          draw.rounded_rectangle([16, 16, 240, 240], radius=48, fill=(30, 58, 138, 255))
+          draw.rectangle([52, 148, 84, 200], fill=(56, 189, 248, 255))
+          draw.rectangle([100, 108, 132, 200], fill=(34, 211, 238, 255))
+          draw.rectangle([148, 72, 180, 200], fill=(16, 185, 129, 255))
+          draw.rectangle([196, 124, 216, 200], fill=(245, 158, 11, 255))
+          img.save('icon.ico', format='ICO', sizes=[(256, 256), (128, 128), (64, 64), (32, 32), (16, 16)])
+
+          launcher = '''
+          import ctypes
+          import functools
+          import http.server
+          import json
+          import os
+          import socketserver
+          import sys
+          import threading
+          import urllib.request
+          import webview
+
+          APP_VERSION = "v1.0.0"
+          RELEASES_API = "https://" + "api.github.com/repos/" + "gouqizi2214730-source/liquiditymapperfast" + ".github.io/releases/latest"
+
+          def enable_dpi_and_appid():
+              try:
+                  ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("LiquidityMapperFast.Desktop.App")
+              except Exception:
+                  pass
+              try:
+                  ctypes.windll.shcore.SetProcessDpiAwareness(2)
+              except Exception:
+                  try:
+                      ctypes.windll.user32.SetProcessDPIAware()
+                  except Exception:
+                      pass
+
+          def resource_path(rel):
+              base = getattr(sys, "_MEIPASS", os.path.abspath("."))
+              return os.path.join(base, rel)
+
+          class QuietHandler(http.server.SimpleHTTPRequestHandler):
+              def log_message(self, format, *args):
+                  pass
+
+          def start_server(dist_dir):
+              handler = functools.partial(QuietHandler, directory=dist_dir)
+              httpd = socketserver.ThreadingTCPServer(("127.0.0.1", 0), handler)
+              httpd.daemon_threads = True
+              port = httpd.server_address[1]
+              t = threading.Thread(target=httpd.serve_forever, daemon=True)
+              t.start()
+              return httpd, port
+
+          def check_updates():
+              try:
+                  req = urllib.request.Request(RELEASES_API, headers={"User-Agent": "LiquidityMapperFast-Desktop"})
+                  with urllib.request.urlopen(req, timeout=5) as resp:
+                      data = json.loads(resp.read().decode("utf-8"))
+                      tag = data.get("tag_name", "")
+                      if tag and tag != APP_VERSION:
+                          print(f"New release available: {tag}")
+              except Exception:
+                  pass
+
+          if __name__ == "__main__":
+              enable_dpi_and_appid()
+              dist_dir = resource_path("dist")
+              httpd, port = start_server(dist_dir)
+              threading.Thread(target=check_updates, daemon=True).start()
+              local_url = "http://" + f"127.0.0.1:{port}/index.html"
+              webview.create_window("LiquidityMapperFast 中文独立桌面版", local_url, width=1400, height=900)
+              webview.start()
+              httpd.shutdown()
+          '''
+          with open('lmap_desktop.py', 'w', encoding='utf-8') as f:
+              f.write(textwrap.dedent(launcher).lstrip())
+
+          iss = '''
+          [Setup]
+          AppName=LiquidityMapperFast
+          AppVersion=1.0.0
+          DefaultDirName={autopf}\\LiquidityMapperFast
+          DefaultGroupName=LiquidityMapperFast
+          OutputDir=Output
+          OutputBaseFilename=LiquidityMapperFast-Setup-win64
+          SetupIconFile=icon.ico
+          Compression=lzma
+          SolidCompression=yes
+          ArchitecturesInstallIn64BitMode=x64compatible
+
+          [Files]
+          Source: "dist\\LiquidityMapperFast\\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
+
+          [Icons]
+          Name: "{group}\\LiquidityMapperFast"; Filename: "{app}\\LiquidityMapperFast.exe"
+          Name: "{autodesktop}\\LiquidityMapperFast"; Filename: "{app}\\LiquidityMapperFast.exe"
+          '''
+          with open('installer.iss', 'w', encoding='utf-8') as f:
+              f.write(textwrap.dedent(iss).lstrip())
+
+      - name: Package with PyInstaller
+        run: |
+          pyinstaller --onedir --noconsole --icon=icon.ico --name LiquidityMapperFast --add-data "lmap_src/dist;dist" --add-data "icon.ico;." lmap_desktop.py
+
+      - name: Build Inno Setup Installer
+        shell: pwsh
+        run: |
+          $iscc = "C:\Program Files (x86)\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) {
+            choco install innosetup -y
+          }
+          & $iscc installer.iss
+
+      - name: Publish Release v1.0.0
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v1.0.0
+          name: LiquidityMapperFast v1.0.0 (Standalone Chinese Desktop Setup)
+          files: Output/LiquidityMapperFast-Setup-win64.exe
