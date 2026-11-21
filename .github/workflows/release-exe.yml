@@ -30,6 +30,12 @@ jobs:
         with:
           python-version: '3.11'
 
+      - name: Build frontend
+        working-directory: lmap_src
+        run: |
+          npm install
+          npx vite build --base=./
+
       - name: Inject Chinese localization and anti-redirect patch
         shell: python
         run: |
@@ -92,16 +98,14 @@ jobs:
             });
           })();
           """
-          index_path = Path('lmap_src/index.html')
-          html = index_path.read_text(encoding='utf-8')
-          html = html.replace('</head>', f'<script>{patch_js}</script></head>')
-          index_path.write_text(html, encoding='utf-8')
-
-      - name: Build frontend
-        working-directory: lmap_src
-        run: |
-          npm install
-          npx vite build --base=./
+          targets = list(Path('lmap_src/dist').rglob('index.html'))
+          if not targets:
+              raise FileNotFoundError('No index.html found under lmap_src/dist')
+          for index_path in targets:
+              html = index_path.read_text(encoding='utf-8')
+              html = html.replace('</head>', f'<script>{patch_js}</script></head>')
+              index_path.write_text(html, encoding='utf-8')
+              print(f'Patched {index_path}')
 
       - name: Install Python dependencies
         run: |
